@@ -111,6 +111,16 @@ Then in your `.c` file you can #include the generated header:
 /* Insert code that uses generated types. */
 ```
 
+## Running upb's tests
+
+When making changes to upd it's prudent to ensure that all tests are
+passing before, and after your change is applied. Run the tests by
+executing the following command.
+
+```bash
+$ bazel test --test_output=errors :all
+```
+
 ## Old "handlers" interfaces
 
 This library contains several semi-deprecated interfaces (see BUILD
