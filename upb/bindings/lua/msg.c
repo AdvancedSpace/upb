@@ -1,6 +1,33 @@
 /*
-** lupb_msg -- Message/Array/Map objects in Lua/C that wrap upb/msg.h
-*/
+ * Copyright (c) 2009-2021, Google LLC
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of Google LLC nor the
+ *       names of its contributors may be used to endorse or promote products
+ *       derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL Google LLC BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * lupb_msg -- Message/Array/Map objects in Lua/C that wrap upb/msg.h
+ */
 
 #include "upb/msg.h"
 
@@ -12,10 +39,11 @@
 
 #include "lauxlib.h"
 #include "upb/bindings/lua/upb.h"
+#include "upb/json_decode.h"
+#include "upb/json_encode.h"
+#include "upb/port_def.inc"
 #include "upb/reflection.h"
 #include "upb/text_encode.h"
-
-#include "upb/port_def.inc"
 
 /*
  * Message/Map/Array objects.  These objects form a directed graph: a message
@@ -42,34 +70,29 @@
  * the wrappers can be collected if they are no longer needed.  A new wrapper
  * object can always be recreated later.
  *
- *                    arena
- *                 +->group
- *                 |
- *                 V        +-----+
+ *                          +-----+
  *            lupb_arena    |cache|-weak-+
  *                 |  ^     +-----+      |
  *                 |  |                  V
  * Lua level       |  +------------lupb_msg
- * ----------------|-----------------|-------------------------------------------
+ * ----------------|-----------------|------------------------------------------
  * upb level       |                 |
  *                 |            +----V------------------------------+
  *                 +->upb_arena | upb_msg  ...(empty arena storage) |
  *                              +-----------------------------------+
  *
  * If the user creates a reference between two objects that have different
- * arenas, we need to merge the arenas into a single, bigger arena group.  The
- * arena group will reference both arenas, and will inherit the longest lifetime
- * of anything in the arena.
+ * arenas, we need to fuse the two arenas together, so that the blocks will
+ * outlive both arenas.
  *
- *                                              arena
- *                 +--------------------------->group<-----------------+
+ *                 +-------------------------->(fused)<----------------+
  *                 |                                                   |
  *                 V                           +-----+                 V
  *            lupb_arena                +-weak-|cache|-weak-+     lupb_arena
  *                 |  ^                 |      +-----+      |        ^   |
  *                 |  |                 V                   V        |   |
  * Lua level       |  +------------lupb_msg              lupb_msg----+   |
- * ----------------|-----------------|-------------------------|---------|-------
+ * ----------------|-----------------|-------------------------|---------|------
  * upb level       |                 |                         |         |
  *                 |            +----V----+               +----V----+    V
  *                 +->upb_arena | upb_msg |               | upb_msg | upb_arena
@@ -77,7 +100,7 @@
  *                                     +---------------------+
  * Key invariants:
  *   1. every wrapper references the arena that contains it.
- *   2. every arena group references all arenas that own upb objects reachable
+ *   2. every fused arena includes all arenas that own upb objects reachable
  *      from that arena.  In other words, when a wrapper references an arena,
  *      this is sufficient to ensure that any upb object reachable from that
  *      wrapper will stay alive.
@@ -85,12 +108,6 @@
  * Additionally, every message object contains a strong reference to the
  * corresponding Descriptor object.  Likewise, array/map objects reference a
  * Descriptor object if they are typed to store message values.
- *
- * (The object cache could be per-arena-group.  This would keep individual cache
- * tables smaller, and when an arena group is freed the entire cache table(s) could
- * be collected in one fell swoop.  However this makes merging another arena
- * into the group an O(n) operation, since all entries would need to be copied
- * from the existing cache table.)
  */
 
 #define LUPB_ARENA "lupb.arena"
@@ -170,13 +187,7 @@ static void lupb_cacheset(lua_State *L, const void *key) {
 /* lupb_arena only exists to wrap a upb_arena.  It is never exposed to users; it
  * is an internal memory management detail.  Other wrapper objects refer to this
  * object from their userdata to keep the arena-owned data alive.
- *
- * The arena userval is a table representing the arena group.  Every arena in
- * the group points to the same table, and the table references all arenas in
- * the group.
  */
-
-#define LUPB_ARENAGROUP_INDEX 1
 
 typedef struct {
   upb_arena *arena;
@@ -190,63 +201,25 @@ static upb_arena *lupb_arena_check(lua_State *L, int narg) {
 upb_arena *lupb_arena_pushnew(lua_State *L) {
   lupb_arena *a = lupb_newuserdata(L, sizeof(lupb_arena), 1, LUPB_ARENA);
   a->arena = upb_arena_new();
-
-  /* Create arena group table and add this arena to it. */
-  lua_createtable(L, 0, 1);
-  lua_pushvalue(L, -2);
-  lua_rawseti(L, -2, 1);
-
-  /* Set arena group as this object's userval. */
-  lua_setiuservalue(L, -2, LUPB_ARENAGROUP_INDEX);
-
   return a->arena;
 }
 
 /**
- * lupb_arena_merge()
+ * lupb_arena_fuse()
  *
  * Merges |from| into |to| so that there is a single arena group that contains
  * both, and both arenas will point at this new table. */
-static void lupb_arena_merge(lua_State *L, int to, int from) {
-  int i, from_count, to_count;
-  lua_getiuservalue(L, to, LUPB_ARENAGROUP_INDEX);
-  lua_getiuservalue(L, from, LUPB_ARENAGROUP_INDEX);
-
-  if (lua_rawequal(L, -1, -2)) {
-    /* These arenas are already in the same group. */
-    lua_pop(L, 2);
-    return;
-  }
-
-  to_count = lua_rawlen(L, -2);
-  from_count = lua_rawlen(L, -1);
-
-  /* Add everything in |from|'s arena group. */
-  for (i = 1; i <= from_count; i++) {
-    lua_rawgeti(L, -1, i);
-    lua_rawseti(L, -3, i + to_count);
-  }
-
-  /* Make |from| point to |to|'s table. */
-  lua_pop(L, 1);
-  lua_setiuservalue(L, from, LUPB_ARENAGROUP_INDEX);
+static void lupb_arena_fuse(lua_State *L, int to, int from) {
+  upb_arena *to_arena = lupb_arena_check(L, to);
+  upb_arena *from_arena = lupb_arena_check(L, from);
+  upb_arena_fuse(to_arena, from_arena);
 }
 
-/**
- * lupb_arena_addobj()
- *
- * Creates a reference from the arena in |narg| to the object at the top of the
- * stack, and pops it.  This will guarantee that the object lives as long as
- * the arena.
- *
- * This is mainly useful for pinning strings we have parsed protobuf data from.
- * It will allow us to point directly to string data in the original string. */
-static void lupb_arena_addobj(lua_State *L, int narg) {
-  lua_getiuservalue(L, narg, LUPB_ARENAGROUP_INDEX);
-  int n = lua_rawlen(L, -1);
-  lua_pushvalue(L, -2);
-  lua_rawseti(L, -2, n + 1);
-  lua_pop(L, 2);  /* obj, arena group. */
+static void lupb_arena_fuseobjs(lua_State *L, int to, int from) {
+  lua_getiuservalue(L, to, LUPB_ARENA_INDEX);
+  lua_getiuservalue(L, from, LUPB_ARENA_INDEX);
+  lupb_arena_fuse(L, lua_absindex(L, -2), lua_absindex(L, -1));
+  lua_pop(L, 2);
 }
 
 static int lupb_arena_gc(lua_State *L) {
@@ -460,6 +433,10 @@ static int lupb_array_newindex(lua_State *L) {
     upb_array_set(larray->arr, n, msgval);
   }
 
+  if (larray->type == UPB_TYPE_MESSAGE) {
+    lupb_arena_fuseobjs(L, 1, 3);
+  }
+
   return 0;  /* 1 for chained assignments? */
 }
 
@@ -597,6 +574,9 @@ static int lupb_map_newindex(lua_State *L) {
   } else {
     upb_msgval val = lupb_tomsgval(L, lmap->value_type, 3, 1, LUPB_COPY);
     upb_map_set(map, key, val, lupb_arenaget(L, 1));
+    if (lmap->value_type == UPB_TYPE_MESSAGE) {
+      lupb_arena_fuseobjs(L, 1, 3);
+    }
   }
 
   return 0;
@@ -626,8 +606,8 @@ static int lupb_mapiter_next(lua_State *L) {
  *   pairs(map)
  */
 static int lupb_map_pairs(lua_State *L) {
-  lupb_map_check(L, 1);
   size_t *iter = lua_newuserdata(L, sizeof(*iter));
+  lupb_map_check(L, 1);
 
   *iter = UPB_MAP_BEGIN;
   lua_pushvalue(L, 1);
@@ -662,22 +642,41 @@ static upb_msg *lupb_msg_check(lua_State *L, int narg) {
   return msg->msg;
 }
 
-static const upb_fielddef *lupb_msg_checkfield(lua_State *L, int msg,
-                                               int field) {
+static const upb_msgdef *lupb_msg_getmsgdef(lua_State *L, int msg) {
+  lua_getiuservalue(L, msg, LUPB_MSGDEF_INDEX);
+  const upb_msgdef *m = lupb_msgdef_check(L, -1);
+  lua_pop(L, 1);
+  return m;
+}
+
+static const upb_fielddef *lupb_msg_tofield(lua_State *L, int msg, int field) {
   size_t len;
   const char *fieldname = luaL_checklstring(L, field, &len);
-  const upb_msgdef *m;
-  const upb_fielddef *f;
+  const upb_msgdef *m = lupb_msg_getmsgdef(L, msg);
+  return upb_msgdef_ntof(m, fieldname, len);
+}
 
-  lua_getiuservalue(L, msg, LUPB_MSGDEF_INDEX);
-  m = lupb_msgdef_check(L, -1);
-  f = upb_msgdef_ntof(m, fieldname, len);
+static const upb_fielddef *lupb_msg_checkfield(lua_State *L, int msg,
+                                               int field) {
+  const upb_fielddef *f = lupb_msg_tofield(L, msg, field);
   if (f == NULL) {
-    luaL_error(L, "no such field '%s'", fieldname);
+    luaL_error(L, "no such field '%s'", lua_tostring(L, field));
   }
-  lua_pop(L, 1);
-
   return f;
+}
+
+upb_msg *lupb_msg_pushnew(lua_State *L, int narg) {
+  const upb_msgdef *m = lupb_msgdef_check(L, narg);
+  lupb_msg *lmsg = lupb_newuserdata(L, sizeof(lupb_msg), 2, LUPB_MSG);
+  upb_arena *arena = lupb_arena_pushnew(L);
+
+  lua_setiuservalue(L, -2, LUPB_ARENA_INDEX);
+  lua_pushvalue(L, 1);
+  lua_setiuservalue(L, -2, LUPB_MSGDEF_INDEX);
+
+  lmsg->msg = upb_msg_new(m, arena);
+  lupb_cacheset(L, lmsg->msg);
+  return lmsg->msg;
 }
 
 /**
@@ -769,28 +768,19 @@ static void lupb_msg_typechecksubmsg(lua_State *L, int narg, int msgarg,
 /* lupb_msg Public API */
 
 /**
- * lupb_msg_pushnew
+ * lupb_msgdef_call
  *
  * Handles:
  *   new_msg = MessageClass()
  *   new_msg = MessageClass{foo = "bar", baz = 3, quux = {foo = 3}}
  */
-int lupb_msg_pushnew(lua_State *L) {
-  int argcount = lua_gettop(L);
-  const upb_msgdef *m = lupb_msgdef_check(L, 1);
-  lupb_msg *lmsg = lupb_newuserdata(L, sizeof(lupb_msg), 2, LUPB_MSG);
-  upb_arena *arena = lupb_arena_pushnew(L);
+int lupb_msgdef_call(lua_State *L) {
+  int arg_count = lua_gettop(L);
+  lupb_msg_pushnew(L, 1);
 
-  lua_setiuservalue(L, -2, LUPB_ARENA_INDEX);
-  lua_pushvalue(L, 1);
-  lua_setiuservalue(L, -2, LUPB_MSGDEF_INDEX);
-
-  lmsg->msg = upb_msg_new(m, arena);
-  lupb_cacheset(L, lmsg->msg);
-
-  if (argcount > 1) {
+  if (arg_count > 1) {
     /* Set initial fields from table. */
-    int msg = lua_gettop(L);
+    int msg = arg_count + 1;
     lua_pushnil(L);
     while (lua_next(L, 2) != 0) {
       lua_pushvalue(L, -2);  /* now stack is key, val, key */
@@ -875,10 +865,7 @@ static int lupb_msg_newindex(lua_State *L) {
   }
 
   if (merge_arenas) {
-    lua_getiuservalue(L, 1, LUPB_ARENA_INDEX);
-    lua_getiuservalue(L, 3, LUPB_ARENA_INDEX);
-    lupb_arena_merge(L, lua_absindex(L, -2), lua_absindex(L, -1));
-    lua_pop(L, 2);
+    lupb_arena_fuseobjs(L, 1, 3);
   }
 
   upb_msg_set(msg, f, msgval, lupb_arenaget(L, 1));
@@ -929,6 +916,19 @@ static const struct luaL_Reg lupb_msg_mm[] = {
 
 /* lupb_msg toplevel **********************************************************/
 
+static int lupb_getoptions(lua_State *L, int narg) {
+  int options = 0;
+  if (lua_gettop(L) >= narg) {
+    size_t len = lua_rawlen(L, narg);
+    for (size_t i = 1; i <= len; i++) {
+      lua_rawgeti(L, narg, i);
+      options |= lupb_checkuint32(L, -1);
+      lua_pop(L, 1);
+    }
+  }
+  return options;
+}
+
 /**
  * lupb_decode()
  *
@@ -940,25 +940,16 @@ static int lupb_decode(lua_State *L) {
   const upb_msgdef *m = lupb_msgdef_check(L, 1);
   const char *pb = lua_tolstring(L, 2, &len);
   const upb_msglayout *layout = upb_msgdef_layout(m);
-  upb_msg *msg;
-  upb_arena *arena;
+  upb_msg *msg = lupb_msg_pushnew(L, 1);
+  upb_arena *arena = lupb_arenaget(L, -1);
+  char *buf;
   bool ok;
 
-  /* Create message. */
-  lua_pushcfunction(L, &lupb_msg_pushnew);
-  lua_pushvalue(L, 1);
-  lua_call(L, 1, 1);
-  msg = lupb_msg_check(L, -1);
+  /* Copy input data to arena, message will reference it. */
+  buf = upb_arena_malloc(arena, len);
+  memcpy(buf, pb, len);
 
-  lua_getiuservalue(L, -1, LUPB_ARENA_INDEX);
-  arena = lupb_arena_check(L, -1);
-
-  /* Pin string data so we can reference it. */
-  lua_pushvalue(L, 2);
-  lupb_arena_addobj(L, -2);
-  lua_pop(L, 1);
-
-  ok = upb_decode(pb, len, msg, layout, arena);
+  ok = _upb_decode(buf, len, msg, layout, arena, UPB_DECODE_ALIAS);
 
   if (!ok) {
     lua_pushstring(L, "Error decoding protobuf.");
@@ -976,16 +967,15 @@ static int lupb_decode(lua_State *L) {
  */
 static int lupb_encode(lua_State *L) {
   const upb_msg *msg = lupb_msg_check(L, 1);
-  const upb_msglayout *layout;
-  upb_arena *arena = lupb_arena_pushnew(L);
+  const upb_msgdef *m = lupb_msg_getmsgdef(L, 1);
+  const upb_msglayout *layout = upb_msgdef_layout(m);
+  int options = lupb_getoptions(L, 2);
+  upb_arena *arena;
   size_t size;
   char *result;
 
-  lua_getiuservalue(L, 1, LUPB_MSGDEF_INDEX);
-  layout = upb_msgdef_layout(lupb_msgdef_check(L, -1));
-  lua_pop(L, 1);
-
-  result = upb_encode(msg, (const void*)layout, arena, &size);
+  arena = lupb_arena_pushnew(L);
+  result = upb_encode_ex(msg, (const void*)layout, options, arena, &size);
 
   if (!result) {
     lua_pushstring(L, "Error encoding protobuf.");
@@ -997,11 +987,101 @@ static int lupb_encode(lua_State *L) {
   return 1;
 }
 
+/**
+ * lupb_jsondecode()
+ *
+ * Handles:
+ *   text_string = upb.json_decode(MessageClass, json_str, {upb.JSONDEC_IGNOREUNKNOWN})
+ */
+static int lupb_jsondecode(lua_State *L) {
+  size_t len;
+  const upb_msgdef *m = lupb_msgdef_check(L, 1);
+  const char *json = lua_tolstring(L, 2, &len);
+  int options = lupb_getoptions(L, 3);
+  upb_msg *msg;
+  upb_arena *arena;
+  upb_status status;
+
+  msg = lupb_msg_pushnew(L, 1);
+  arena = lupb_arenaget(L, -1);
+  upb_status_clear(&status);
+  upb_json_decode(json, len, msg, m, NULL, options, arena, &status);
+  lupb_checkstatus(L, &status);
+
+  return 1;
+}
+
+/**
+ * lupb_jsonencode()
+ *
+ * Handles:
+ *   text_string = upb.json_encode(msg, {upb.JSONENC_EMITDEFAULTS})
+ */
+static int lupb_jsonencode(lua_State *L) {
+  upb_msg *msg = lupb_msg_check(L, 1);
+  const upb_msgdef *m = lupb_msg_getmsgdef(L, 1);
+  int options = lupb_getoptions(L, 2);
+  char buf[1024];
+  size_t size;
+  upb_status status;
+
+  upb_status_clear(&status);
+  size = upb_json_encode(msg, m, NULL, options, buf, sizeof(buf), &status);
+  lupb_checkstatus(L, &status);
+
+  if (size < sizeof(buf)) {
+    lua_pushlstring(L, buf, size);
+  } else {
+    char *ptr = malloc(size + 1);
+    upb_json_encode(msg, m, NULL, options, ptr, size + 1, &status);
+    lupb_checkstatus(L, &status);
+    lua_pushlstring(L, ptr, size);
+    free(ptr);
+  }
+
+  return 1;
+}
+
+/**
+ * lupb_textencode()
+ *
+ * Handles:
+ *   text_string = upb.text_encode(msg, {upb.TXTENC_SINGLELINE})
+ */
+static int lupb_textencode(lua_State *L) {
+  upb_msg *msg = lupb_msg_check(L, 1);
+  const upb_msgdef *m = lupb_msg_getmsgdef(L, 1);
+  int options = lupb_getoptions(L, 2);
+  char buf[1024];
+  size_t size;
+
+  size = upb_text_encode(msg, m, NULL, options, buf, sizeof(buf));
+
+  if (size < sizeof(buf)) {
+    lua_pushlstring(L, buf, size);
+  } else {
+    char *ptr = malloc(size + 1);
+    upb_text_encode(msg, m, NULL, options, ptr, size + 1);
+    lua_pushlstring(L, ptr, size);
+    free(ptr);
+  }
+
+  return 1;
+}
+
+static void lupb_setfieldi(lua_State *L, const char *field, int i) {
+  lua_pushinteger(L, i);
+  lua_setfield(L, -2, field);
+}
+
 static const struct luaL_Reg lupb_msg_toplevel_m[] = {
   {"Array", lupb_array_new},
   {"Map", lupb_map_new},
   {"decode", lupb_decode},
   {"encode", lupb_encode},
+  {"json_decode", lupb_jsondecode},
+  {"json_encode", lupb_jsonencode},
+  {"text_encode", lupb_textencode},
   {NULL, NULL}
 };
 
@@ -1012,6 +1092,18 @@ void lupb_msg_registertypes(lua_State *L) {
   lupb_register_type(L, LUPB_ARRAY, NULL, lupb_array_mm);
   lupb_register_type(L, LUPB_MAP,   NULL, lupb_map_mm);
   lupb_register_type(L, LUPB_MSG,   NULL, lupb_msg_mm);
+
+  lupb_setfieldi(L, "TXTENC_SINGLELINE", UPB_TXTENC_SINGLELINE);
+  lupb_setfieldi(L, "TXTENC_SKIPUNKNOWN", UPB_TXTENC_SKIPUNKNOWN);
+  lupb_setfieldi(L, "TXTENC_NOSORT", UPB_TXTENC_NOSORT);
+
+  lupb_setfieldi(L, "ENCODE_DETERMINISTIC", UPB_ENCODE_DETERMINISTIC);
+  lupb_setfieldi(L, "ENCODE_SKIPUNKNOWN", UPB_ENCODE_SKIPUNKNOWN);
+
+  lupb_setfieldi(L, "JSONENC_EMITDEFAULTS", UPB_JSONENC_EMITDEFAULTS);
+  lupb_setfieldi(L, "JSONENC_PROTONAMES", UPB_JSONENC_PROTONAMES);
+
+  lupb_setfieldi(L, "JSONDEC_IGNOREUNKNOWN", UPB_JSONDEC_IGNOREUNKNOWN);
 
   lupb_cacheinit(L);
 }
